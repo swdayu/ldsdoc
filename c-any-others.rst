@@ -290,23 +290,278 @@ WIN32 系统
 
 这里描述 cygwin/mingw 等 WIN32 系统上的 GNU 链接器相关内容。
 
-import libraries
+**导入库**
 
-resource only dlls
+标准 Windows 链接器会创建导入库（import libraries），这种库包含链接 dll 库的信息。它
+们是常规的静态归档文件并且像其他静态库一样处理。cygwin 和 mingw 版本的链接器提供了命令
+行选项 --out-implib 来特别支持创建这种库。
 
-exporting dll symbols
-    using auto-export functionality
-    using a def file
-    using decorations
+**资源型 DLL**
 
-automatic data imports
+可以创建一个仅包含资源的 DLL，即只有一个 .rsrc 分区，这需要使用定制的链接脚本才能做到。
+这时因为内置的默认链接脚本总是会创建 .text 以及 .idata 分区，尽管这些分区不包含内容。以
+下是一个脚本示例，其中 OUTPUT_FORMAT 按需要改成你想要的目标格式。 ::
 
-direct linking to a dll
+    OUTPUT_FORMAT(pei-i386)
+    SECTIONS
+    {
+        . = SIZEOF_HEADERS;
+        . = ALIGN(__section_alignment__);
+        .rsrc __image_base__ + __section_alignment__ : ALIGN(4)
+        {
+            KEEP (*(.rsrc))
+            KEEP (*(.rsrc$*))
+        }
+        /DISCARD/ : { *(*) }
+    }
 
-symbol aliasing
-    adding additional names
-    renaming symbols
+该脚本保存为 rsrc.ld，下面的命令用来创建一个 rsrc.dll 动态链接库文件： ::
 
-weak externals
+    ld -dll --subsystem windows -e 0 -s rsrc.o -o rsrc.dll -T rsrc.ld
 
-aligned common symbols
+
+**导出 DLL 符号**
+
+cygwin/mingw 版本的链接器有几种导出符号到 DLL 的方法：使用自动导出功能，使用 def 文件，
+在源代码中的使用 __declspec 声明。
+
+默认情况下，链接器会通过自动导出功能导出符号，它们通过以下命令行选项控制： ::
+
+    --export-all-symbols # 默认选项
+    --exclude-symbols
+    --exclude-libs
+    --exclude-modules-for-implib
+    --version-script
+
+当自动导出功能开启时，链接器在生成 DLL 文件时会自动导出其中找到的所有非本地符号，包括全
+局（global）和通用（common）符号。除了少部分是已知属于系统运行时或库符号不会被导出。由
+于通常不希望导出所有符号，其中可能包括不是任何公共结构一部分的私有函数，所有可以使用上面
+的命令行选项排除不需要的符号。使用 --output-def 选项可以看到最终的导出符号列表，同时考
+虑了所有排除项。如果命令行没有明确给出 --export-all-symbols，那么自动导出功能在以下情
+况下会被禁用：
+
+1. 使用了一个 DEF 文件
+2. 任何目标文件中的符号使用了 __declspec(dllexport) 属性修饰符
+
+如果使用了一个 DEF 文件，会根据该文件导出符号。DEF 文件是一个 ASCII 文件包含当创建 DLL
+文件时需要导出的符号。通常该文件被命名为 <dll name>.def，后缀名必须时 .def 或者 .DEF，
+DEF 文件向其他命令行输入文件一样传入，例如： ::
+
+    gcc -o <output> <objectfiles> <dll name>.def
+
+使用 DEF 文件会禁掉自动导出功能，除非显式指定了 --export-all-symbols 选项。以下是一个
+共享库 xyz.dll 对应的 DEF 文件： ::
+
+    LIBRARY "xyz.dll" BASE=0x20000000
+
+    EXPORTS
+    foo
+    bar
+    _bar = bar
+    another_foo = abc.dll.afoo
+    var1 DATA
+    doo = foo == foo2
+    eoo DATA == var1
+
+该文件定义了一个 DLL，具有非默认基地址以及导出表中的七个符号。第三个导出符号 _bar 是第
+二个符号的别名。第四个符号 another_foo 通过转发创建另一个库（abc.dll）中的符号（afoo）
+的别名。最后一个符号 var1 被声明为数据对象。导出库中的 doo 符号是 foo 的别名，并在导出
+表中获得了一个名称 foo2。符号 eoo 是一个数据导出符号，并在导出表中获得了一个名称 var1。
+
+可选的命令 LIBRARY <name> 指定输出 DLL 文件的内部名称，如果没有指定后缀名，将附加默认
+后缀名 .DLL。当使用 DEL 文件构建应用程序而不是动态库时，应该使用 NAME 而不是 LIBRARY
+命令，如果不包含后缀，则附加默认可执行文件后缀 .EXE。无论是库还是可执行文件，都可以使用
+BASE 为映像指定非默认的基地址。如果未指定 NAME 或 LIBRARY，或者制定了一个空字符串，那
+么内部名称与命令行指定的文件名相同。
+
+一个导出符号的完整规范描述如下： ::
+
+    EXPORTS
+    ( ((<name1> [= <name2>]) | (<name1> = <module-name>.<external-name>))
+      [@ <integer>] [NONAME] [DATA] [CONSTANT] [PRIVATE] [== <name3>] ) *
+
+其中 name1 是 DLL 中的一个导出符号，或者是 name2 的一个导出别名，或者是另一个 DLL 中符
+号的别名。可选地，符号可以导出为一个指定序号 <integer> 的别名。可选的 name3 可以在符号
+的导入/导出表中作为字符串使用。而其中可选的关键字 NONAME、DATA、CONSTANT、PRIVATE 的含
+义如下。
+
+NONAME 表示不要在 DLL 文件中的导出表中保存该符号名称，它仍然可以通过其序号别名（由 DEF
+指定或由链接器分配）导出。但是符号名称仍然在导入库中可见，除非还指定了 PRIVATE。
+
+DATA 表示符号是一个变量或者对象，而不是函数。生成的导入库其中导出的符号是对变量例如 foo
+的间接引用，即一个名为 _imp__foo 的符号，因此 foo 必须被解析为 ``*_imp_foo``。
+
+CONSTANT 类似于 DATA，但在导入库中放入 _imp__foo 符号的同时，还放入了未修饰的 foo。两
+者都引用的是只读导入地址表中的变量的地址，而不是变量本身。这可能是危险的，如果用户代码没
+有添加 dllimport 属性，也没有显式添加使用属性所保证的额外间接性信息，应用程序将出现意外
+行为。
+
+PRIVATE 将符号放入 DLL 导出表中，但不会放入在链接时用于解析导入符号的静态导入库中。但是
+符号仍然可以在运行时使用 LoadLibrary/GetProcAddress 进行导入，或者通过 GNU 链接器扩展
+直接链接该 DLL 而不需要对应的导入库。参考 ld/deffilep.y 中的 DEF 文件完整规范。当链接
+创建一个 DLL 动态库时，可以使用命令行选项 --output-def 同时创建一个 DEF 文件。
+
+另一种导出动态库符号的方法是修改源代码本身，每个要导出的符号都声明为： ::
+
+    __declspec(dllexport) int a_variable;
+    __declspec(dllexport) void a_function(int with_args);
+
+如果任何目标文件中包含这种修饰的符号时，会禁用正常的自动导出功能，除非同时指定了命令行选
+项 --export-all-symbols。但是当使用动态库文件中的符号时，需要使用 dllimport： ::
+
+    __declspec(dllimport) int a_variable;
+    __declspec(dllimport) void a_function(int with_args);
+
+这会导致库头文件结构变动复杂，因为要根据情况声明未 dllexport 还是 dllimport。有一些通
+用方法可以规避这一点，例如代码完全省略 __declspec 声明，参考 --enable-auto-import 自
+动导入选项以及自动数据导入功能。
+
+**自动数据导入**
+
+标准 Windows DLL 格式仅通过在代码中添加 __declspec 声明来支持数据导入，这会让编译器生
+成特定的汇编语言指令来处理这种数据导入。这增加了将现有 Unix 代码移植到这些平台所需的工作
+量，特别是对于大型 C++ 库和应用程序。自动导入特性最初是由 Paul Sokolovsky 提供，它允许
+省略 __declspec 修饰符以实现符合 POSIX/Unix 平台的行为。此特性通过 --enable-auto-import
+选项启用，在 cygwin/mingw 上该选项默认会自动启用。因此该选项本身现在主要用于抑制产生的
+任何警告，这些警告通常会在链接的目标文件触发了该特性的使用时产生。
+
+变量的自动导入并不总能在没有额外帮助的情况下了完成工作，有时你会看到这样的消息：无法自动
+导入变量 <var>，请阅读链接器文档中的 --enable-auto-import 选项以获取详细信息。该选项文
+档解释了为什么会出现此错误，并提供了几种可以解决的方法。其中一种方法是下面描述的运行时伪
+重定位功能（runtime pseudo-relocs）。
+
+对于从 DLL 导入的复杂变量（如结构体或类），目标文件通过包含变量的基地址和变量内的偏移量
+（即附加值 addend），例如指定了特定字段或公共成员。不幸的是，WIN32 环境中使用的运行时加
+载器无法在没有 dllimport/dllexport 声明提供的额外信息的帮助下在运行时修复这些引用。也
+因此上面标准的自动导入功能不能解析这些引用（即对象内部字段的引用）。
+
+使用选项 --enable-runtime-pseudo-relocs 允许在不出错的情况下解析这些引用，同时将调整
+引用本身（及其非零附加值）的任务留给运行时环境提供的专用代码。最新的 cygwin/mingw 环境
+和编译器提供了这种运行时支持，但旧版本则没有。然而这种支持仅在开发人员平台上时必需的，因
+为编译结果可以在旧系统上无误地运行。--enable-runtime-pseudo-relocs 不是默认选项，必须
+显式地指定。
+
+**直接链接 DLL**
+
+cygwin/mingw 版本的链接器支持从 DLL 库文件直接进行链接导入其中的符号（包括数据符号），
+而不必借助导入库。这比传统的导入库的方式快很多，也节省了大量内存，特别是当链接大型库或应
+用程序时。当链接器创建一个导入库时，DLL 中导出的每个函数或变量都存储在自己这个符号对应的
+BFD 中，即使一个 BFD 可以包含很多导出符号。因此存储、加载和处理如果多的 bfd 会产生相当
+大的开销，这解释了在使用导入库时尤其是对于特别大或复杂的库，需要大量的时间、内存、和存储
+空间。
+
+直接链接 DLL 动态库文件不需要任何额外的命令行选项，除了 -L 和 -l，因为链接器已经搜索到
+了匹配每个库的一些列名称。从开发者的角度来看，只需要理解这个搜索过程，就可以知道链接器怎
+样直接对 DLL 动态库文件进行链接，而不是从导入库中加载符号。例如，当链接器处理库文件选项
+-lxxx 选项时，它会依次按顺序尝试以下的搜索目录，找到第一个找到的库即可： ::
+
+    libxxx.dll.a
+    xxx.dll.a
+    libxxx.a
+    xxx.lib
+    libxxx.lib
+    cygxxx.dll(*)
+    libxxx.dll
+    xxx.dll
+
+其中的 cygxxx.dll 不一定是 cygxxx.dll，而实际上是 <prefix>xxx.dll，<prefix> 是由选
+项 --dll-search-prefix=<prefix> 指定的名称前缀。在 cygwin 的情况下，标准的 gcc 规范
+文件包含 --dll-search-prefix=cyg。其他基于 WIN32 的 Unix 环境，如 mingw 或 pw32，可
+能使用其他的 <prefix>，尽管目前只有 cygwin 使用此功能。它最初旨在帮助避免伪各种 WIN32
+或 Unix 环境构建的 DLL 之间的名称冲突，以便两个版本的 DLL 可以在同一台机器上共存。
+
+通用的 cygwin/mingw 搜索路径使用 bin 目录查找可执行文件和 DLL 文件，使用 lib 目录查找
+导入库文件（使用 cygwin 的命名法）： ::
+
+    bin/
+        cygxxx.dll
+    lib/
+        libxxx.dll.a # 对于 dll 的情况
+        libxxx.a     # 对于静态库的情况
+
+直接链接到 DLL 动态库文件，而不是间接的使用导入库，可以通过两种方法完成；
+
+1. 直接使用 DLL，通过将 bin 路径添加到链接命令行中，例如： ::
+
+        gcc -Wl,-verbose -o a.exe -L../bin/ -lxxx
+
+   由于 DLL 的名称通常会附加版本号（例如 cygncurses-5.dll），这常常会失败，除非指定选
+   项 -L../bin -lncurses-5 来包含版本号。导入库则通常没有版本，因而没有这个困难。
+
+2. 根据以上的搜索规则，从 DLL 创建一个符号链接保存到 lib 目录中，这样旧不需要改变任何构
+   建环境的情况下进行链接： ::
+
+        ln -s bin/cygxxx.dll lib/[cyg|lib|]xxx.dll[.a]
+        gcc -Wl,-verbose -o a.exe -L../lib/ -lxxx
+
+   这种方法也规避了版本号的问题，因为下面的做法是完全合法的： ::
+
+        bin/
+            cgxxx-5.dll
+        lib/
+            libxxx.dll.a -> ../bin/cygxxx-5.dll
+
+即使还在使用自动导入功能以及 --enable-runtime-pseudo-relocs，不使用导入库而直接对 DLL
+进行链接也是可行的。鉴于链接速度和内存使用方面的改进，人们可能会合理地想知道为什么还要使
+用导入库。其中由三个原因：
+
+1. 直到最近，直接链接 DLL 还不支持自动数据导入的功能
+2. 有时需要在导入库中包含纯静态的目标（导入库它本来只包含 bfd 间接地指向 DLL 中导出的符
+   号），而 cygwin 内核的导入库利用了这个功能，没有导入库是无法做到这一点的
+3. 符号别名只能使用导入库来解析，当链接到操作系统提供的 DLL 时，这是至关重要的，其中符号
+   通常作为修饰的别名导出，而实际对应的是 stdcall 修饰的汇编名称
+
+所以导入库不会消失。但是，能够简单直接链接到一个 DLL 动态库在很多情况下，是 binutils 工
+具集为 WIN32 开发者提供的一个有用的补充。鉴于在链接期间的内存需求、存储需求、和链接速度
+方面的大幅改进，我们预计许多开发者会尽可能的使用这个功能。
+
+**符号别名**
+
+有时导出一个额外的名称是很有用的。一个符号 foo 被导出为 foo，但还可以额外地导出为 _foo，
+这会影响到可选生成的导入库文件。考虑下面的 DEF 文件： ::
+
+    LIBRARY "xyz.dll" BASE=0x61000000
+
+    EXPORTS
+    foo
+    _foo = foo
+
+另一种创建一个额外的名称的方法是，在源代码中使用一个弱别名属性，参考下面的例子。更多信息
+可以参考 gcc 手册中的属性以及弱符号的内容。 ::
+
+    void foo() { /* do something */; }
+    void _foo() __attribute__ ((weak, alias("foo")));
+
+还有一种情况是，不添加额外的别名，而是将原名称改名之后导出。例如 cygwin 内核经常这样做。
+符号 _foo 可以作为 foo 导出，这同样会影响到创建的导入库。例如： ::
+
+    LIBRARY "xyz.dll" BASE=0x61000000
+
+    EXPORTS
+    _foo = foo
+
+注意，使用 DEF 文件会禁用默认的自动导出功能，除非制定了命令行选项 --export-all-symbols。
+然而，如果尝试重命名符号，那么应该在 DEF 文件中列出所有期望的导出符号，包含那些没有被重
+命名的符号，并且不要使用 --export-all-symbols 选项。如果只在 DEF 文件中列出重命名的符
+号，并使用了 --export-all-symbols 来处理其他符号，那么重命名符号将会和原符号一起同时导
+出。实际上是添加了一个额外的名称，而不是重命名，这可能不是想要的。
+
+**弱外部引用**
+
+Windows 目标格式 PE 指定了一种弱符号的形式称为弱外部引用。当链接一个弱符号时没有找到这
+个符号的定义，这个弱符号将变成另一个符号的别名。弱外部引用有三种变体：
+
+1. 在其他目标文件和库文件中搜索符号的定义，历史上称为懒外部引用
+2. 仅搜索其他目标文件，不搜索库文件。这种形式目前尚未实现
+3. 不进行搜索，符号是一个别名。这种形式目前尚未实现
+
+作为 GNU 的扩展，不指定一个替换符号的弱符号是支持的。如果链接时符号未定义，则符号使用默
+认值。
+
+**对齐的通用符号**
+
+作为对 PE 目标格式的 GNU 扩展，可以指定通用符号的期望对齐字节数。这些信息是通过 GNU 特
+定命令从汇编器或编译器传递到链接器的，这些命令包含在目标文件的 .drectve 分区中，由链接
+器识别，并在处理通用符号内存布局时使用。使用此 GNU 扩展的目标文件可以被原生工具处理，但
+这些工具将无法识别 .drectve 中的对齐指令，并可能产生关于未知链接器指令（directives）的
+警告。
