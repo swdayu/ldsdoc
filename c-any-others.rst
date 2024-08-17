@@ -460,7 +460,7 @@ BFD 中，即使一个 BFD 可以包含很多导出符号。因此存储、加�
     libxxx.a
     xxx.lib
     libxxx.lib
-    cygxxx.dll(*)
+    cygxxx.dll
     libxxx.dll
     xxx.dll
 
